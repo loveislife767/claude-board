@@ -1,3 +1,5 @@
 board-state.json
 sets/
 *.log
+
+ClaudeBoard.Types.dll
