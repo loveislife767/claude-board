@@ -19,6 +19,7 @@ Claude Code already writes everything needed to fix this — it just isn't surfa
 
 - **Lists every session on disk**, newest first, grouped `PINNED` / `OPEN NOW` / `NOT OPEN`
 - **Real titles** — the ones Claude generates for each conversation, not the first line you typed
+- **`/rename` finally sticks** — names survive closing the tab, a reboot, and every resume
 - **Green dot = running right now**
 - **Single click → jumps Windows Terminal to that session's tab**
 - **Double click → resumes a closed session** in a new tab, in its original working directory
@@ -66,7 +67,7 @@ You can also skip the installer entirely and run `pwsh -sta -File .\ClaudeBoard.
 
 ## How it works
 
-Three things make this possible, none of them documented anywhere obvious.
+Four things make this possible, none of them documented anywhere obvious.
 
 **Session titles are on disk.** Claude Code stores each conversation at
 `%USERPROFILE%\.claude\projects\<encoded-cwd>\<session-id>.jsonl`, and writes records like
@@ -74,6 +75,17 @@ Three things make this possible, none of them documented anywhere obvious.
 one wins, and it gets rewritten as a conversation drifts, so the board scans both the head and
 the tail of each file and caches per last-write-time. Only top-level `*.jsonl` files count —
 the `<session-id>\` subfolders are subagent transcripts and aren't resumable.
+
+**`/rename` is thrown away on exit, and the board fixes that.** Claude Code keeps the name you
+give a session in `%USERPROFILE%\.claude\sessions\<pid>.json` — keyed by *process id*, deleted
+when that process exits, and never written into the transcript. So the name dies with the
+terminal, `--resume` brings the session back as `simon-1f`, and nothing downstream can see it.
+`tools\SessionNames.ps1` mirrors those names into `%USERPROFILE%\.claude\session-names.json`
+keyed by session id instead; a one-minute scheduled task harvests them even when the board is
+closed. A saved name outranks the ai-title on the board, and gets handed back with `--name` on
+every resume, so the board, the prompt box, the `/resume` picker and the tab title agree.
+Auto-generated names carry `"nameSource":"derived"` — the ones you typed don't, which is how
+the two are told apart. Right-click → **Rename (sticks)** writes straight to the store.
 
 **Windows Terminal tabs can be driven through UI Automation.** There's no CLI for "focus the
 tab named X". But each tab is a `TabItem` in the UIA tree exposing `SelectionItemPattern`, so

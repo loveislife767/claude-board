@@ -47,10 +47,46 @@ Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
 $Root      = Join-Path $env:USERPROFILE '.claude\projects'
 $StatePath = Join-Path $PSScriptRoot 'board-state.json'
 
+# ---- persistent /rename names ----------------------------------------------
+# Claude Code keeps the name from /rename in .claude\sessions\<pid>.json and
+# deletes that file on exit, so the name never reaches the transcript and never
+# survives a resume. SessionNames.ps1 mirrors it into a store keyed by session id.
+$script:NamesOk = $false
+try {
+    $sn = Join-Path $PSScriptRoot 'tools\SessionNames.ps1'
+    if (Test-Path -LiteralPath $sn) { . $sn; $script:NamesOk = $true }
+} catch { $script:NamesOk = $false }
+if (-not $script:NamesOk) {
+    function Get-ClaudeLiveSessions { @() }
+    function Sync-SessionNames { 0 }
+    function Read-SessionNames { @{} }
+    function Set-SessionName { param([string]$Id, [string]$Name) $Name }
+}
+
+# ---- laptop<->desktop bridge (companion "Desktop" panel) -------------------
+# Cross-machine logic lives in Downloads\desktop-claude-bridge; dot-source its
+# helper so Invoke-Bridge / Resolve-DesktopSession / Assert-ClaudeTarget are
+# available. If that folder isn't present the Board just runs local-only.
+$script:BridgeDir = if ($env:DESKTOP_BRIDGE_DIR) { $env:DESKTOP_BRIDGE_DIR }
+                    else { Join-Path $env:USERPROFILE 'Downloads\desktop-claude-bridge' }
+$script:BridgeOk = $false
+try {
+    $bc = Join-Path $script:BridgeDir '_Bridge.Common.ps1'
+    if (Test-Path -LiteralPath $bc) { . $bc; $script:BridgeOk = $true }
+} catch { $script:BridgeOk = $false }
+
 # ---------------------------------------------------------------- native bits
 
-if (-not ('ClaudeBoard.Native' -as [type])) {
-Add-Type -Namespace ClaudeBoard -Name Native -UsingNamespace System.Collections.Generic, System.Text -MemberDefinition @'
+$script:Helpers = @'
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+
+namespace ClaudeBoard {
+
+public static class Native {
     [DllImport("user32.dll")] static extern bool EnumWindows(EnumWindowsProc cb, IntPtr p);
     delegate bool EnumWindowsProc(IntPtr h, IntPtr p);
     [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
@@ -61,9 +97,6 @@ Add-Type -Namespace ClaudeBoard -Name Native -UsingNamespace System.Collections.
     [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
     [DllImport("user32.dll")] static extern bool AttachThreadInput(uint a, uint b, bool f);
     [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
-    [DllImport("user32.dll")] public static extern bool RegisterHotKey(IntPtr h, int id, uint mod, uint vk);
-    [DllImport("user32.dll")] public static extern bool UnregisterHotKey(IntPtr h, int id);
-
     [DllImport("user32.dll")] static extern int GetClassName(IntPtr h, StringBuilder s, int n);
 
     // Every ConPTY shell owns a hidden-but-"visible" PseudoConsoleWindow.
@@ -95,13 +128,7 @@ Add-Type -Namespace ClaudeBoard -Name Native -UsingNamespace System.Collections.
         SetForegroundWindow(h);
         if (fg != me) AttachThreadInput(fg, me, false);
     }
-'@
 }
-
-if (-not ('SessionItem' -as [type])) {
-Add-Type -TypeDefinition @'
-using System;
-using System.ComponentModel;
 
 public class SessionItem : INotifyPropertyChanged {
     public event PropertyChangedEventHandler PropertyChanged;
@@ -116,6 +143,7 @@ public class SessionItem : INotifyPropertyChanged {
     public string Project { get; set; }
     public string Prompt  { get; set; }
     public string AiTitle { get; set; }
+    public string Name    { get; set; }   // from /rename - beats AiTitle
     public int    ShellPid { get; set; }
     public int    ClaudePid { get; set; }
 
@@ -157,7 +185,44 @@ public class SessionItem : INotifyPropertyChanged {
     }
     public int GroupRank { get { return _hidden ? 3 : (_pinned ? 0 : (_live ? 1 : 2)); } }
 }
+
+}
 '@
+
+# Compiling this C# at every launch cost ~4 seconds, which made the desktop
+# icon feel dead. Build it once to a DLL and just load it after that.
+if (-not ('ClaudeBoard.SessionItem' -as [type])) {
+    $dll = Join-Path $PSScriptRoot 'ClaudeBoard.Types.dll'
+    $stale = -not (Test-Path -LiteralPath $dll) -or
+             (Get-Item -LiteralPath $dll).LastWriteTimeUtc -lt (Get-Item -LiteralPath $PSCommandPath).LastWriteTimeUtc
+    if ($stale) {
+        # Another running board may hold the old DLL open; fall back to memory.
+        try { Add-Type -TypeDefinition $script:Helpers -OutputAssembly $dll -OutputType Library -ErrorAction Stop }
+        catch { }
+    }
+    try { Add-Type -Path $dll -ErrorAction Stop }
+    catch { Add-Type -TypeDefinition $script:Helpers -ErrorAction Stop }
+}
+
+# ---------------------------------------------------------------- single instance
+
+# Clicking the desktop icon twice should raise the board, not start a second
+# copy of it. The mutex settles the race between two fast double-clicks; the
+# window hunt handles the ordinary "it's already open" case.
+if (-not $Diagnose) {
+    $isNew = $false
+    $script:Mutex = New-Object System.Threading.Mutex($true, 'Local\ClaudeBoardSingleInstance', [ref]$isNew)
+    if (-not $isNew) {
+        $deadline = (Get-Date).AddSeconds(12)
+        do {
+            $other = Get-Process -ErrorAction SilentlyContinue |
+                     Where-Object { $_.MainWindowTitle -eq 'Claude Board' -and $_.Id -ne $PID } |
+                     Select-Object -First 1
+            if ($other) { [ClaudeBoard.Native]::Focus($other.MainWindowHandle); return }
+            Start-Sleep -Milliseconds 250
+        } while ((Get-Date) -lt $deadline)
+        return   # already starting somewhere; don't add a duplicate
+    }
 }
 
 # ---------------------------------------------------------------- session store
@@ -233,6 +298,10 @@ function Read-SessionMeta {
 function Get-Sessions {
     if (-not (Test-Path $Root)) { return @() }
     $out = New-Object System.Collections.Generic.List[object]
+    # Harvest first: a name the user just typed into /rename is only on disk in a
+    # pid file that vanishes the moment that terminal closes.
+    [void](Sync-SessionNames)
+    $names = Read-SessionNames
 
     foreach ($dir in (Get-ChildItem -LiteralPath $Root -Directory -ErrorAction SilentlyContinue)) {
         # Top-level *.jsonl only - the <id>\ subfolders are subagent transcripts,
@@ -253,6 +322,7 @@ function Get-Sessions {
                 Cwd      = $c.Meta.Cwd
                 Prompt   = $c.Meta.Prompt
                 AiTitle  = $c.Meta.AiTitle
+                Name     = $names[$f.BaseName]
                 Modified = $f.LastWriteTime
                 SizeKB   = [int][math]::Round($f.Length / 1KB)
             })
@@ -262,13 +332,22 @@ function Get-Sessions {
 }
 
 function Get-LiveMap {
-    # claude.exe --resume <id> is the reliable signal; the pwsh parent owns the tab.
+    # Two signals. The command line only names a session that was --resume'd, so it
+    # misses every plain `claude`; the .claude\sessions\<pid>.json files name all of
+    # them and are what Claude Code itself uses. Take both - the pid files win.
     $map = @{}
+    $parent = @{}
     $procs = @(Get-CimInstance Win32_Process -Filter "Name='claude.exe'" -ErrorAction SilentlyContinue)
     foreach ($p in $procs) {
+        $parent[[int]$p.ProcessId] = [int]$p.ParentProcessId
         if ($p.CommandLine -and $p.CommandLine -match '--resume\s+"?([0-9a-fA-F-]{36})') {
             $map[$Matches[1]] = @{ ClaudePid = [int]$p.ProcessId; ShellPid = [int]$p.ParentProcessId }
         }
+    }
+    foreach ($s in (Get-ClaudeLiveSessions)) {
+        # A stale pid file (crash, not a clean exit) must not mark a dead session live.
+        if (-not $parent.ContainsKey($s.Pid)) { continue }
+        $map[$s.Id] = @{ ClaudePid = $s.Pid; ShellPid = $parent[$s.Pid] }
     }
     $map
 }
@@ -368,7 +447,7 @@ function Get-MatchScore {
 function Get-SessionTokens {
     param($Item)
     $toks = New-Object System.Collections.Generic.List[string]
-    foreach ($x in @($Item.AiTitle, (Split-Path $Item.Cwd -Leaf))) {
+    foreach ($x in @($Item.Name, $Item.AiTitle, (Split-Path $Item.Cwd -Leaf))) {
         foreach ($t in (Split-Tokens $x)) { $toks.Add($t) }
     }
     # The opening prompt drifts off-topic fast, so only sample its head.
@@ -423,12 +502,14 @@ function Resolve-TabLinks {
         }
     }
 
-    # 2. exact ai-title match
+    # 2. exact title match - the name from /rename, else the ai-title
     foreach ($it in $Items) {
-        if ($result.Map.ContainsKey($it.Id) -or -not $it.AiTitle) { continue }
+        if ($result.Map.ContainsKey($it.Id)) { continue }
+        $want2 = if ($it.Name) { $it.Name } else { $it.AiTitle }
+        if (-not $want2) { continue }
         for ($i = 0; $i -lt $tabInfo.Count; $i++) {
             if ($taken[$i]) { continue }
-            if ($tabInfo[$i].Clean -ieq $it.AiTitle.Trim()) {
+            if ($tabInfo[$i].Clean -ieq $want2.Trim()) {
                 $result.Map[$it.Id] = $tabInfo[$i].Tab
                 $result.Exact[$it.Id] = $true
                 $taken[$i] = $true
@@ -498,14 +579,19 @@ function Open-Session {
     $sh  = if (Get-Command pwsh.exe -ErrorAction SilentlyContinue) { 'pwsh.exe' } else { 'powershell.exe' }
     $wt  = (Get-Command wt.exe -ErrorAction SilentlyContinue).Source
     $cwd = if (Test-Path -LiteralPath $Item.Cwd) { $Item.Cwd } else { $env:USERPROFILE }
-    $ttl = ConvertTo-TabTitle ($(if ($Item.AiTitle) { $Item.AiTitle } else { $Item.Prompt }))
+    $ttl = ConvertTo-TabTitle ($(if ($Item.Name) { $Item.Name } elseif ($Item.AiTitle) { $Item.AiTitle } else { $Item.Prompt }))
+
+    # --resume alone comes back named "simon-1f"; hand the saved name back so the
+    # prompt box, the /resume picker and the tab all agree with the board.
+    $cmd = "claude --resume $($Item.Id)"
+    if ($Item.Name) { $cmd += " --name `"$($Item.Name -replace '"', '')`"" }
 
     if ($wt) {
         $target = if ($NewWindow) { 'new' } else { '0' }
-        & $wt -w $target new-tab --title $ttl -d $cwd -- $sh -NoExit -Command "claude --resume $($Item.Id)"
+        & $wt -w $target new-tab --title $ttl -d $cwd -- $sh -NoExit -Command $cmd
     } else {
         Start-Process $sh -ArgumentList @('-NoExit', '-Command',
-            "Set-Location -LiteralPath '$cwd'; claude --resume $($Item.Id)")
+            "Set-Location -LiteralPath '$cwd'; $cmd")
     }
     "resumed: $ttl"
 }
@@ -735,6 +821,7 @@ $xaml = @'
         </Border>
         <StackPanel Grid.Column="1" Orientation="Horizontal">
           <Button x:Name="BtnNew"   Style="{StaticResource Chip}" Content="+"  ToolTip="Start a new session (pick a folder)"/>
+          <Button x:Name="BtnDesk"  Style="{StaticResource Chip}" Content="&#x1F5A5;" ToolTip="Desktop sessions (laptop&#8596;desktop bridge)"/>
           <Button x:Name="BtnRef"   Style="{StaticResource Chip}" Content="&#x21bb;" ToolTip="Refresh"/>
           <Button x:Name="BtnEye"   Style="{StaticResource Chip}" Content="&#x2298;" ToolTip="Show hidden sessions"/>
           <Button x:Name="BtnPin"   Style="{StaticResource Chip}" Content="&#x25ce;" ToolTip="Always on top"/>
@@ -816,6 +903,7 @@ $xaml = @'
           <MenuItem x:Name="MnuWin"    Header="Resume in a new window"/>
           <Separator/>
           <MenuItem x:Name="MnuLink"   Header="Link to a tab..."/>
+          <MenuItem x:Name="MnuRename" Header="Rename (sticks)..."/>
           <MenuItem x:Name="MnuPin"    Header="Pin / unpin"/>
           <MenuItem x:Name="MnuFolder" Header="Open its folder"/>
           <MenuItem x:Name="MnuCopy"   Header="Copy resume command"/>
@@ -836,13 +924,13 @@ $xaml = @'
 '@
 
 $win = [Windows.Markup.XamlReader]::Parse($xaml)
-foreach ($n in 'Search','Hint','List','Status','BtnNew','BtnRef','BtnEye','BtnPin','BtnLeft','BtnRight',
-                'MnuFocus','MnuTab','MnuWin','MnuLink','MnuPin','MnuFolder','MnuCopy',
+foreach ($n in 'Search','Hint','List','Status','BtnNew','BtnDesk','BtnRef','BtnEye','BtnPin','BtnLeft','BtnRight',
+                'MnuFocus','MnuTab','MnuWin','MnuLink','MnuRename','MnuPin','MnuFolder','MnuCopy',
                 'MnuHide','MnuKill','MnuDelete') {
     Set-Variable -Name $n -Value $win.FindName($n) -Scope Script
 }
 
-$script:Items = New-Object System.Collections.ObjectModel.ObservableCollection[SessionItem]
+$script:Items = New-Object System.Collections.ObjectModel.ObservableCollection[ClaudeBoard.SessionItem]
 $view = [System.Windows.Data.ListCollectionView]::new($script:Items)
 $view.SortDescriptions.Add([ComponentModel.SortDescription]::new('GroupRank', 'Ascending'))
 $view.SortDescriptions.Add([ComponentModel.SortDescription]::new('Modified', 'Descending'))
@@ -856,6 +944,7 @@ $view.Filter = [Predicate[object]]{
     if (-not $script:Filter) { return $true }
     $f = $script:Filter
     ($o.Title -and $o.Title.ToLowerInvariant().Contains($f)) -or
+    ($o.AiTitle -and $o.AiTitle.ToLowerInvariant().Contains($f)) -or
     ($o.Project -and $o.Project.ToLowerInvariant().Contains($f)) -or
     ($o.Prompt -and $o.Prompt.ToLowerInvariant().Contains($f))
 }
@@ -882,11 +971,14 @@ function Update-Board {
         # A tab titled exactly like the session proves it is open, which is the
         # only way to see a session started as plain `claude`.
         $isLive = $live.ContainsKey($s.Id) -or [bool]$res.Exact[$s.Id]
-        $title  = if ($s.AiTitle) { $s.AiTitle } else { $s.Prompt }
+        # A name he chose outranks the ai-title, which Claude rewrites constantly.
+        $title  = if ($s.Name) { $s.Name } elseif ($s.AiTitle) { $s.AiTitle } else { $s.Prompt }
         $proj   = Format-Project $s.Cwd
         # Most sessions run from the home folder; printing "~" 50 times is noise.
         $sub    = "$(Format-Ago $s.Modified)  ·  $(Format-Size $s.SizeKB)"
         if ($proj -ne '~') { $sub = "$proj  ·  $sub" }
+        # With his own name on the row, the ai-title is what still says what it's about.
+        if ($s.Name -and $s.AiTitle -and $s.AiTitle -ne $s.Name) { $sub = "$($s.AiTitle)  ·  $sub" }
 
         $isHidden = $script:HiddenIds.ContainsKey($s.Id)
         $tab = $res.Map[$s.Id]
@@ -903,14 +995,14 @@ function Update-Board {
 
         $it = $byId[$s.Id]
         if (-not $it) {
-            $it = New-Object SessionItem
+            $it = New-Object ClaudeBoard.SessionItem
             $it.Id = $s.Id
             $it.Pinned = $pinned.ContainsKey($s.Id)
             $script:Items.Add($it)
             $regroup = $true
         }
         $it.Cwd = $s.Cwd; $it.Path = $s.Path; $it.Project = $proj
-        $it.Prompt = $s.Prompt; $it.AiTitle = $s.AiTitle
+        $it.Prompt = $s.Prompt; $it.AiTitle = $s.AiTitle; $it.Name = $s.Name
         $it.Title = $title; $it.Sub = $sub; $it.Modified = $s.Modified
         $it.Linked = [bool]$tab
         if ($it.IsLive -ne $isLive -or $it.Hidden -ne $isHidden) { $regroup = $true }
@@ -1171,7 +1263,25 @@ $MnuPin.Add_Click({
 $MnuFolder.Add_Click({ $s = Get-Selected; if ($s -and (Test-Path -LiteralPath $s.Cwd)) { Start-Process explorer.exe $s.Cwd } })
 $MnuCopy.Add_Click({
     $s = Get-Selected
-    if ($s) { Set-Clipboard "cd '$($s.Cwd)'; claude --resume $($s.Id)"; Set-Status 'resume command copied' }
+    if ($s) {
+        $c = "cd '$($s.Cwd)'; claude --resume $($s.Id)"
+        if ($s.Name) { $c += " --name `"$($s.Name -replace '"', '')`"" }
+        Set-Clipboard $c; Set-Status 'resume command copied'
+    }
+})
+$MnuRename.Add_Click({
+    $s = Get-Selected
+    if (-not $s) { return }
+    $new = Show-InputDialog "Rename `"$($s.Title)`"" `
+        "Sticks to this chat for good - through closing the tab, a reboot and every resume. Leave it empty to go back to the title Claude picks." `
+        -Text $s.Name -Ok 'Rename' -SingleLine
+    if ($null -eq $new) { return }
+    [void](Set-SessionName -Id $s.Id -Name $new)
+    Update-Board
+    Set-Status $(if ($new.Trim()) {
+        if ($s.IsLive) { "named `"$($new.Trim())`" - run /rename in its tab to change it there too" }
+        else { "named `"$($new.Trim())`"" }
+    } else { 'name cleared' })
 })
 $BtnEye.Add_Click({
     $script:ShowHidden = -not $script:ShowHidden
@@ -1252,9 +1362,17 @@ $win.Add_SourceInitialized({
 })
 
 $win.Add_Loaded({
-    Update-Board -Deep
-    $timer.Start()
     $Search.Focus()
+    Set-Status 'reading your sessions...'
+    # Paint the window first. The opening scan reads every transcript and walks
+    # each terminal's automation tree, and doing that inline made the board look
+    # like it had failed to start.
+    [void]$win.Dispatcher.BeginInvoke(
+        [System.Windows.Threading.DispatcherPriority]::Background,
+        [action]{
+            try { Update-Board -Deep } catch { Set-Status "startup error: $($_.Exception.Message)" }
+            $timer.Start()
+        })
 })
 
 $win.Add_Closing({ $timer.Stop(); Save-State })
@@ -1265,5 +1383,278 @@ $win.Add_PreviewKeyDown({
         $Search.Focus(); $Search.SelectAll(); $_.Handled = $true
     }
 })
+
+# ============================================================
+# DESKTOP BRIDGE PANEL  -  laptop <-> desktop Claude sessions
+# A companion window over Downloads\desktop-claude-bridge: list the desktop's
+# Claude sessions and read / talk to / attach any of them. Self-contained;
+# touches none of the local-board data model above.
+# ============================================================
+
+$script:PopupBtnStyle = @'
+    <Style TargetType="Button">
+      <Setter Property="Foreground" Value="#EDEBE4"/>
+      <Setter Property="Background" Value="#2A2620"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Padding" Value="10,0"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="b" Background="{TemplateBinding Background}" CornerRadius="5">
+              <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="b" Property="Background" Value="#D97757"/></Trigger>
+              <Trigger Property="IsEnabled" Value="False"><Setter Property="Foreground" Value="#6E6A63"/></Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+'@
+
+function Show-TextPopup {
+    param([string]$Title, [string]$Text)
+    $x = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="$([Security.SecurityElement]::Escape($Title))" Width="860" Height="640"
+        Background="#16150F" Foreground="#EDEBE4" WindowStartupLocation="CenterOwner" FontFamily="Segoe UI">
+  <Window.Resources>$script:PopupBtnStyle</Window.Resources>
+  <Grid Margin="10">
+    <Grid.RowDefinitions><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+    <Border Grid.Row="0" Background="#12110C" BorderBrush="#2A2620" BorderThickness="1" CornerRadius="6">
+      <TextBox x:Name="T" IsReadOnly="True" TextWrapping="Wrap" AcceptsReturn="True"
+               VerticalScrollBarVisibility="Auto" Background="Transparent" Foreground="#D7D3CA"
+               BorderThickness="0" Padding="12" FontFamily="Cascadia Mono, Consolas" FontSize="12.5"/>
+    </Border>
+    <StackPanel Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,10,0,0">
+      <Button x:Name="Copy" Content="Copy all" Width="100" Height="30" Margin="0,0,8,0"/>
+      <Button x:Name="Close" Content="Close" Width="100" Height="30"/>
+    </StackPanel>
+  </Grid>
+</Window>
+"@
+    $d = [Windows.Markup.XamlReader]::Parse($x)
+    $tb = $d.FindName('T'); $tb.Text = $Text
+    $d.FindName('Copy').Add_Click({ try { Set-Clipboard $Text } catch { } }.GetNewClosure())
+    $d.FindName('Close').Add_Click({ $d.Close() }.GetNewClosure())
+    $d.Owner = $win
+    [void]$d.ShowDialog()
+}
+
+function Show-InputDialog {
+    param([string]$Title, [string]$Prompt, [string]$Text, [string]$Ok = 'Send', [switch]$SingleLine)
+    # A one-line answer wants Enter to mean OK; a message to a session wants Enter
+    # to mean newline, so the box only swallows it in the multi-line case.
+    $multi = if ($SingleLine) { 'False' } else { 'True' }
+    $h     = if ($SingleLine) { '210' } else { '250' }
+    $x = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="$([Security.SecurityElement]::Escape($Title))" Width="640" Height="$h"
+        Background="#16150F" Foreground="#EDEBE4" WindowStartupLocation="CenterOwner"
+        FontFamily="Segoe UI" ResizeMode="NoResize">
+  <Window.Resources>$script:PopupBtnStyle</Window.Resources>
+  <Grid Margin="16">
+    <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+    <TextBlock Grid.Row="0" Text="$([Security.SecurityElement]::Escape($Prompt))" Foreground="#B8B4AC" TextWrapping="Wrap" Margin="0,0,0,10"/>
+    <TextBox x:Name="In" Grid.Row="1" Background="#12110C" Foreground="#EDEBE4" CaretBrush="#D97757"
+             BorderBrush="#2A2620" BorderThickness="1" Padding="8" TextWrapping="Wrap" AcceptsReturn="$multi"/>
+    <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
+      <Button x:Name="Ok" Content="$([Security.SecurityElement]::Escape($Ok))" Width="100" Height="30" Margin="0,0,8,0" IsDefault="True"/>
+      <Button x:Name="No" Content="Cancel" Width="100" Height="30"/>
+    </StackPanel>
+  </Grid>
+</Window>
+"@
+    $d = [Windows.Markup.XamlReader]::Parse($x)
+    $in = $d.FindName('In')
+    if ($Text) { $in.Text = $Text; $in.SelectAll() }
+    $script:InputResult = $null
+    $d.FindName('Ok').Add_Click({ $script:InputResult = $in.Text; $d.DialogResult = $true }.GetNewClosure())
+    $d.FindName('No').Add_Click({ $d.DialogResult = $false }.GetNewClosure())
+    $d.Owner = $win
+    $in.Focus()
+    if ($d.ShowDialog()) { return $script:InputResult }
+    return $null
+}
+
+$script:DeskWin = $null
+function Show-DesktopPanel {
+    if (-not $script:BridgeOk) {
+        [System.Windows.MessageBox]::Show(
+            "Desktop bridge not found.`n`nExpected _Bridge.Common.ps1 in:`n$script:BridgeDir`n`nSet `$env:DESKTOP_BRIDGE_DIR if it lives elsewhere.",
+            'Desktop bridge', 'OK', 'Warning') | Out-Null
+        return
+    }
+    if ($script:DeskWin) { try { $script:DeskWin.Activate(); return } catch { $script:DeskWin = $null } }
+
+    $xaml2 = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Desktop sessions" Width="560" Height="720" Background="#16150F" Foreground="#EDEBE4"
+        WindowStartupLocation="CenterOwner" FontFamily="Segoe UI">
+  <Window.Resources>
+    $script:PopupBtnStyle
+    <Style TargetType="ListBoxItem">
+      <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+      <Setter Property="Padding" Value="0"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ListBoxItem">
+            <Border x:Name="r" Background="Transparent" BorderThickness="3,0,0,0" BorderBrush="Transparent">
+              <ContentPresenter/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="r" Property="Background" Value="#211E19"/></Trigger>
+              <Trigger Property="IsSelected" Value="True">
+                <Setter TargetName="r" Property="Background" Value="#2A2620"/>
+                <Setter TargetName="r" Property="BorderBrush" Value="#D97757"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+  </Window.Resources>
+  <Grid>
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto"/><RowDefinition Height="*"/>
+      <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+    </Grid.RowDefinitions>
+    <Border Grid.Row="0" Background="#1C1A15" Padding="12,10">
+      <StackPanel Orientation="Horizontal">
+        <TextBlock Text="Desktop" Foreground="#EDEBE4" FontSize="14" FontWeight="SemiBold" VerticalAlignment="Center"/>
+        <TextBlock x:Name="Host" Foreground="#7E7A72" FontSize="11" Margin="8,0,0,0" VerticalAlignment="Center"/>
+        <Button x:Name="Refresh" Content="&#x21bb; refresh" Height="26" Margin="14,0,0,0"/>
+      </StackPanel>
+    </Border>
+    <ListBox x:Name="Lst" Grid.Row="1" Background="Transparent" BorderThickness="0"
+             ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+      <ListBox.ItemTemplate>
+        <DataTemplate>
+          <Grid Margin="10,7,10,7">
+            <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+            <Ellipse Grid.Column="0" Width="7" Height="7" Fill="{Binding Dot}" VerticalAlignment="Top" Margin="0,5,9,0"/>
+            <StackPanel Grid.Column="1">
+              <TextBlock Text="{Binding Line1}" Foreground="#EDEBE4" FontSize="12.5" TextTrimming="CharacterEllipsis"/>
+              <TextBlock Text="{Binding Line2}" Foreground="#7E7A72" FontSize="10.5" Margin="0,3,0,0" TextTrimming="CharacterEllipsis"/>
+            </StackPanel>
+          </Grid>
+        </DataTemplate>
+      </ListBox.ItemTemplate>
+    </ListBox>
+    <WrapPanel Grid.Row="2" Margin="10,8,10,4">
+      <Button x:Name="BRead"   Content="Read"        Height="30" Width="92"  Margin="0,0,6,6"/>
+      <Button x:Name="BSend"   Content="Send msg..." Height="30" Width="104" Margin="0,0,6,6"/>
+      <Button x:Name="BAttach" Content="Attach"      Height="30" Width="92"  Margin="0,0,6,6"/>
+      <Button x:Name="BCopy"   Content="Copy cmd"    Height="30" Width="100" Margin="0,0,6,6"/>
+    </WrapPanel>
+    <Border Grid.Row="3" Background="#1C1A15" Padding="12,7">
+      <TextBlock x:Name="St" Foreground="#7E7A72" FontSize="10.5" TextTrimming="CharacterEllipsis"/>
+    </Border>
+  </Grid>
+</Window>
+"@
+    $dw = [Windows.Markup.XamlReader]::Parse($xaml2)
+    $Lst = $dw.FindName('Lst'); $St = $dw.FindName('St'); $HostT = $dw.FindName('Host')
+    $HostT.Text = $script:DesktopHost
+    $script:DeskWin = $dw
+
+    $selRow = { $Lst.SelectedItem }
+    $setSt  = { param($m) $St.Text = $m }
+
+    $reload = {
+        & $setSt 'loading desktop sessions...'
+        try {
+            $raw  = Invoke-Bridge 'list'
+            $rows = @($raw | ConvertFrom-Json)
+            $Lst.Items.Clear()
+            foreach ($r in $rows) {
+                $dot = if ($r.live) { '#6EA8FE' } else { '#4A5568' }
+                $l1  = (($(if ($r.target) { $r.target + '  ' } else { '' })) + $r.title)
+                $l2parts = @()
+                if ($r.project -and $r.project -ne '~') { $l2parts += $r.project }
+                $l2parts += $r.ago
+                if ($r.live) { $l2parts += 'live' } elseif ($r.size_kb) { $l2parts += "$($r.size_kb) KB" }
+                $Lst.Items.Add([pscustomobject]@{
+                    Dot = $dot; Line1 = $l1; Line2 = ($l2parts -join ('  ' + [char]0x00b7 + '  '))
+                    _t = $r.target; _id = $r.id; _live = [bool]$r.live; _title = $r.title
+                }) | Out-Null
+            }
+            $live = @($rows | Where-Object { $_.live }).Count
+            & $setSt "$($rows.Count) sessions  ·  $live live   (double-click = read)"
+        } catch {
+            & $setSt "error: $($_.Exception.Message.Split([char]10)[0])"
+            Show-TextPopup 'Desktop bridge error' $_.Exception.Message
+        }
+    }
+
+    $doRead = {
+        $s = & $selRow; if (-not $s) { & $setSt 'pick a session first'; return }
+        & $setSt "reading $($s._title)..."
+        try {
+            if ($s._live -and $s._t) { $txt = Invoke-Bridge "capture --target $(Q $s._t) --lines 140" }
+            elseif ($s._id)          { $txt = Invoke-Bridge "read --id $($s._id) --tail 30" }
+            else { & $setSt 'nothing to read for that row'; return }
+            Show-TextPopup "read: $($s._title)" $txt
+            & $setSt 'ready'
+        } catch { Show-TextPopup 'read failed' $_.Exception.Message; & $setSt 'read failed' }
+    }
+
+    $doSend = {
+        $s = & $selRow; if (-not $s) { & $setSt 'pick a session first'; return }
+        if (-not $s._live -or -not $s._t) { & $setSt "'$($s._title)' isn't live - can't type into a saved transcript"; return }
+        $msg = Show-InputDialog "Send to $($s._title)  ($($s._t))" "Types this straight into that live desktop session, as if you keyed it in. It will run."
+        if (-not $msg) { return }
+        try {
+            Assert-ClaudeTarget $s._t | Out-Null
+            Invoke-Desktop "tmux send-keys -t $(Q $s._t) -l -- $(Q $msg)" | Out-Null
+            Start-Sleep -Milliseconds 250
+            Invoke-Desktop "tmux send-keys -t $(Q $s._t) Enter" | Out-Null
+            & $setSt "sent to $($s._t) - waiting 13s for a reply..."
+            Start-Sleep -Seconds 13
+            $reply = Invoke-Bridge "capture --target $(Q $s._t) --lines 55"
+            Show-TextPopup "reply from $($s._title)  ($($s._t))" $reply
+            & $setSt 'ready'
+        } catch { Show-TextPopup 'send failed' $_.Exception.Message; & $setSt 'send failed' }
+    }
+
+    $doAttach = {
+        $s = & $selRow; if (-not $s) { & $setSt 'pick a session first'; return }
+        if (-not $s._live -or -not $s._t) { & $setSt "'$($s._title)' isn't live - nothing to attach to"; return }
+        $sess = ($s._t -split ':')[0]
+        $remote = "tmux select-window -t $($s._t) 2>/dev/null; exec tmux attach -t $sess"
+        $wt = (Get-Command wt.exe -ErrorAction SilentlyContinue).Source
+        try {
+            if ($wt) { & $wt -w 0 new-tab --title "dt:$($s._title)" -- ssh -t $script:DesktopHost $remote }
+            else { Start-Process 'ssh' -ArgumentList @('-t', $script:DesktopHost, $remote) }
+            & $setSt "attaching to $($s._t) in a terminal (Ctrl-b d to detach)"
+        } catch { & $setSt "attach failed: $($_.Exception.Message)" }
+    }
+
+    $doCopy = {
+        $s = & $selRow; if (-not $s) { & $setSt 'pick a session first'; return }
+        if ($s._live -and $s._t)   { $arg = "-Target $($s._t)" }
+        elseif ($s._id)            { $arg = "-Id $($s._id)" }
+        else                       { $arg = "-Query `"$($s._title)`"" }
+        $cmd = "pwsh -NoProfile -File `"$script:BridgeDir\Read-DesktopChat.ps1`" $arg -Screen"
+        try { Set-Clipboard $cmd; & $setSt 'copied a read-command - paste it into any laptop Claude chat and say "run this"' } catch { }
+    }
+
+    $dw.FindName('Refresh').Add_Click($reload)
+    $dw.FindName('BRead').Add_Click($doRead)
+    $dw.FindName('BSend').Add_Click($doSend)
+    $dw.FindName('BAttach').Add_Click($doAttach)
+    $dw.FindName('BCopy').Add_Click($doCopy)
+    $Lst.Add_MouseDoubleClick($doRead)
+    $dw.Add_Closed({ $script:DeskWin = $null })
+    $dw.Owner = $win
+    $dw.Add_ContentRendered($reload)
+    [void]$dw.Show()
+}
+
+$BtnDesk.Add_Click({ Show-DesktopPanel })
 
 [void]$win.ShowDialog()
