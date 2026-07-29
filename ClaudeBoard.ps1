@@ -196,12 +196,17 @@ if (-not ('ClaudeBoard.SessionItem' -as [type])) {
     $stale = -not (Test-Path -LiteralPath $dll) -or
              (Get-Item -LiteralPath $dll).LastWriteTimeUtc -lt (Get-Item -LiteralPath $PSCommandPath).LastWriteTimeUtc
     if ($stale) {
-        # Another running board may hold the old DLL open; fall back to memory.
-        try { Add-Type -TypeDefinition $script:Helpers -OutputAssembly $dll -OutputType Library -ErrorAction Stop }
-        catch { }
+        # Another running board may hold the old DLL open. If the rebuild can't
+        # land, compile in memory - loading the stale copy instead means the new
+        # code runs against the old class, and every property this version added
+        # throws on assignment. That failure looks like a nearly empty board.
+        try   { Add-Type -TypeDefinition $script:Helpers -OutputAssembly $dll -OutputType Library -ErrorAction Stop }
+        catch { Add-Type -TypeDefinition $script:Helpers -ErrorAction Stop; $stale = $false; $dll = $null }
     }
-    try { Add-Type -Path $dll -ErrorAction Stop }
-    catch { Add-Type -TypeDefinition $script:Helpers -ErrorAction Stop }
+    if ($dll) {
+        try { Add-Type -Path $dll -ErrorAction Stop }
+        catch { Add-Type -TypeDefinition $script:Helpers -ErrorAction Stop }
+    }
 }
 
 # ---------------------------------------------------------------- single instance
