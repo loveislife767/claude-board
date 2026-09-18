@@ -64,11 +64,16 @@ if (-not $script:NamesOk) {
 }
 
 # ---- laptop<->desktop bridge (companion "Desktop" panel) -------------------
-# Cross-machine logic lives in Downloads\desktop-claude-bridge; dot-source its
+# Cross-machine logic lives in a desktop-claude-bridge folder; dot-source its
 # helper so Invoke-Bridge / Resolve-DesktopSession / Assert-ClaudeTarget are
 # available. If that folder isn't present the Board just runs local-only.
-$script:BridgeDir = if ($env:DESKTOP_BRIDGE_DIR) { $env:DESKTOP_BRIDGE_DIR }
-                    else { Join-Path $env:USERPROFILE 'Downloads\desktop-claude-bridge' }
+# $env:DESKTOP_BRIDGE_DIR wins; otherwise take the first known spot that has it.
+$script:BridgeDir = if ($env:DESKTOP_BRIDGE_DIR) { $env:DESKTOP_BRIDGE_DIR } else {
+    $cands = @('Downloads\Projects\desktop-claude-bridge', 'Downloads\desktop-claude-bridge') |
+             ForEach-Object { Join-Path $env:USERPROFILE $_ }
+    $hit = $cands | Where-Object { Test-Path -LiteralPath (Join-Path $_ '_Bridge.Common.ps1') } | Select-Object -First 1
+    if ($hit) { $hit } else { $cands[0] }
+}
 $script:BridgeOk = $false
 try {
     $bc = Join-Path $script:BridgeDir '_Bridge.Common.ps1'
