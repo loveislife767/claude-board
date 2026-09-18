@@ -1498,7 +1498,7 @@ function Show-DesktopPanel {
     $xaml2 = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Desktop sessions" Width="560" Height="720" Background="#16150F" Foreground="#EDEBE4"
+        Title="Remote sessions" Width="560" Height="720" Background="#16150F" Foreground="#EDEBE4"
         WindowStartupLocation="CenterOwner" FontFamily="Segoe UI">
   <Window.Resources>
     $script:PopupBtnStyle
@@ -1530,7 +1530,8 @@ function Show-DesktopPanel {
     </Grid.RowDefinitions>
     <Border Grid.Row="0" Background="#1C1A15" Padding="12,10">
       <StackPanel Orientation="Horizontal">
-        <TextBlock Text="Desktop" Foreground="#EDEBE4" FontSize="14" FontWeight="SemiBold" VerticalAlignment="Center"/>
+        <TextBlock Text="Remote" Foreground="#EDEBE4" FontSize="14" FontWeight="SemiBold" VerticalAlignment="Center"/>
+        <ComboBox x:Name="Mach" Height="24" Width="118" Margin="10,0,0,0" VerticalAlignment="Center"/>
         <TextBlock x:Name="Host" Foreground="#7E7A72" FontSize="11" Margin="8,0,0,0" VerticalAlignment="Center"/>
         <Button x:Name="Refresh" Content="&#x21bb; refresh" Height="26" Margin="14,0,0,0"/>
       </StackPanel>
@@ -1564,35 +1565,54 @@ function Show-DesktopPanel {
 "@
     $dw = [Windows.Markup.XamlReader]::Parse($xaml2)
     $Lst = $dw.FindName('Lst'); $St = $dw.FindName('St'); $HostT = $dw.FindName('Host')
-    $HostT.Text = $script:DesktopHost
+    $Mach = $dw.FindName('Mach')
+    foreach ($n in (Get-BridgeMachines 'all').Name) { [void]$Mach.Items.Add($n) }
+    [void]$Mach.Items.Add('all')
+    $Mach.SelectedIndex = 0
     $script:DeskWin = $dw
 
     $selRow = { $Lst.SelectedItem }
     $setSt  = { param($m) $St.Text = $m }
+    # Which machine a row lives on - rows carry it, so "all" stays actionable.
+    $rowMachine = { param($r) if ($r -and $r._m) { Get-BridgeMachine $r._m } else { Get-BridgeMachine $Mach.SelectedItem } }
 
     $reload = {
-        & $setSt 'loading desktop sessions...'
+        $sel = "$($Mach.SelectedItem)"
+        & $setSt "loading $sel sessions..."
         try {
-            $raw  = Invoke-Bridge 'list'
-            $rows = @($raw | ConvertFrom-Json)
+            $rows = @()
+            $errs = @()
+            foreach ($m in (Get-BridgeMachines $sel)) {
+                try {
+                    foreach ($r in @(Invoke-BridgeArgv -Argv @('list') -Machine $m | ConvertFrom-Json)) {
+                        $r | Add-Member -NotePropertyName machine -NotePropertyValue $m.Name -Force
+                        $rows += $r
+                    }
+                } catch { $errs += "$($m.Name): $($_.Exception.Message.Split([char]10)[0])" }
+            }
+            $HostT.Text = if ((Get-BridgeMachines $sel).Count -eq 1) { (Get-BridgeMachine $sel).Host } else { 'both machines' }
             $Lst.Items.Clear()
             foreach ($r in $rows) {
-                $dot = if ($r.live) { '#6EA8FE' } else { '#4A5568' }
+                $dot = if ($r.live) { if ($r.waiting_for) { '#E0B341' } else { '#6EA8FE' } } else { '#4A5568' }
                 $l1  = (($(if ($r.target) { $r.target + '  ' } else { '' })) + $r.title)
                 $l2parts = @()
+                if ((Get-BridgeMachines $sel).Count -gt 1) { $l2parts += $r.machine }
                 if ($r.project -and $r.project -ne '~') { $l2parts += $r.project }
                 $l2parts += $r.ago
-                if ($r.live) { $l2parts += 'live' } elseif ($r.size_kb) { $l2parts += "$($r.size_kb) KB" }
+                if ($r.live) { $l2parts += $(if ($r.waiting_for) { "waiting: $($r.waiting_for)" } elseif ($r.status) { $r.status } else { 'live' }) }
+                elseif ($r.size_kb) { $l2parts += "$($r.size_kb) KB" }
                 $Lst.Items.Add([pscustomobject]@{
                     Dot = $dot; Line1 = $l1; Line2 = ($l2parts -join ('  ' + [char]0x00b7 + '  '))
-                    _t = $r.target; _id = $r.id; _live = [bool]$r.live; _title = $r.title
+                    _t = $r.target; _id = $r.id; _live = [bool]$r.live; _title = $r.title; _m = $r.machine
                 }) | Out-Null
             }
             $live = @($rows | Where-Object { $_.live }).Count
-            & $setSt "$($rows.Count) sessions  ·  $live live   (double-click = read)"
+            $msg = "$($rows.Count) sessions  ·  $live live   (double-click = read)"
+            if ($errs) { $msg = "$msg   ·  " + ($errs -join ' | ') }
+            & $setSt $msg
         } catch {
             & $setSt "error: $($_.Exception.Message.Split([char]10)[0])"
-            Show-TextPopup 'Desktop bridge error' $_.Exception.Message
+            Show-TextPopup 'Bridge error' $_.Exception.Message
         }
     }
 
@@ -1600,27 +1620,30 @@ function Show-DesktopPanel {
         $s = & $selRow; if (-not $s) { & $setSt 'pick a session first'; return }
         & $setSt "reading $($s._title)..."
         try {
-            if ($s._live -and $s._t) { $txt = Invoke-Bridge "capture --target $(Q $s._t) --lines 140" }
-            elseif ($s._id)          { $txt = Invoke-Bridge "read --id $($s._id) --tail 30" }
+            $m = & $rowMachine $s
+            if ($s._live -and $s._t) { $txt = Invoke-BridgeArgv -Argv @('capture','--target',$s._t,'--lines','140') -Machine $m }
+            elseif ($s._id)          { $txt = Invoke-BridgeArgv -Argv @('read','--id',$s._id,'--tail','30') -Machine $m }
             else { & $setSt 'nothing to read for that row'; return }
-            Show-TextPopup "read: $($s._title)" $txt
+            Show-TextPopup "read: $($s._title)  [$($m.Name)]" $txt
             & $setSt 'ready'
         } catch { Show-TextPopup 'read failed' $_.Exception.Message; & $setSt 'read failed' }
     }
 
     $doSend = {
         $s = & $selRow; if (-not $s) { & $setSt 'pick a session first'; return }
+        $m = & $rowMachine $s
+        if (-not $m.CanSteer) { & $setSt "$($m.Name) is Windows - no way to type into a live session there (read + ask only)"; return }
         if (-not $s._live -or -not $s._t) { & $setSt "'$($s._title)' isn't live - can't type into a saved transcript"; return }
-        $msg = Show-InputDialog "Send to $($s._title)  ($($s._t))" "Types this straight into that live desktop session, as if you keyed it in. It will run."
+        $msg = Show-InputDialog "Send to $($s._title)  ($($s._t) on $($m.Name))" "Types this straight into that live session, as if you keyed it in. It will run."
         if (-not $msg) { return }
         try {
-            Assert-ClaudeTarget $s._t | Out-Null
-            Invoke-Desktop "tmux send-keys -t $(Q $s._t) -l -- $(Q $msg)" | Out-Null
+            Assert-ClaudeTarget -Target $s._t -Machine $m | Out-Null
+            Invoke-Remote -Command "tmux send-keys -t $(Q $s._t) -l -- $(Q $msg)" -Machine $m | Out-Null
             Start-Sleep -Milliseconds 250
-            Invoke-Desktop "tmux send-keys -t $(Q $s._t) Enter" | Out-Null
+            Invoke-Remote -Command "tmux send-keys -t $(Q $s._t) Enter" -Machine $m | Out-Null
             & $setSt "sent to $($s._t) - waiting 13s for a reply..."
             Start-Sleep -Seconds 13
-            $reply = Invoke-Bridge "capture --target $(Q $s._t) --lines 55"
+            $reply = Invoke-BridgeArgv -Argv @('capture','--target',$s._t,'--lines','55') -Machine $m
             Show-TextPopup "reply from $($s._title)  ($($s._t))" $reply
             & $setSt 'ready'
         } catch { Show-TextPopup 'send failed' $_.Exception.Message; & $setSt 'send failed' }
@@ -1628,27 +1651,31 @@ function Show-DesktopPanel {
 
     $doAttach = {
         $s = & $selRow; if (-not $s) { & $setSt 'pick a session first'; return }
+        $m = & $rowMachine $s
+        if (-not $m.CanSteer) { & $setSt "$($m.Name) has no tmux - nothing to attach to (open the tab on that machine instead)"; return }
         if (-not $s._live -or -not $s._t) { & $setSt "'$($s._title)' isn't live - nothing to attach to"; return }
         $sess = ($s._t -split ':')[0]
         $remote = "tmux select-window -t $($s._t) 2>/dev/null; exec tmux attach -t $sess"
         $wt = (Get-Command wt.exe -ErrorAction SilentlyContinue).Source
         try {
-            if ($wt) { & $wt -w 0 new-tab --title "dt:$($s._title)" -- ssh -t $script:DesktopHost $remote }
-            else { Start-Process 'ssh' -ArgumentList @('-t', $script:DesktopHost, $remote) }
+            if ($wt) { & $wt -w 0 new-tab --title "dt:$($s._title)" -- ssh -t $m.Host $remote }
+            else { Start-Process 'ssh' -ArgumentList @('-t', $m.Host, $remote) }
             & $setSt "attaching to $($s._t) in a terminal (Ctrl-b d to detach)"
         } catch { & $setSt "attach failed: $($_.Exception.Message)" }
     }
 
     $doCopy = {
         $s = & $selRow; if (-not $s) { & $setSt 'pick a session first'; return }
+        $m = & $rowMachine $s
         if ($s._live -and $s._t)   { $arg = "-Target $($s._t)" }
         elseif ($s._id)            { $arg = "-Id $($s._id)" }
         else                       { $arg = "-Query `"$($s._title)`"" }
-        $cmd = "pwsh -NoProfile -File `"$script:BridgeDir\Read-DesktopChat.ps1`" $arg -Screen"
+        $cmd = "pwsh -NoProfile -File `"$script:BridgeDir\Read-DesktopChat.ps1`" $arg -Machine $($m.Name)$(if ($m.CanScreen) { ' -Screen' })"
         try { Set-Clipboard $cmd; & $setSt 'copied a read-command - paste it into any laptop Claude chat and say "run this"' } catch { }
     }
 
     $dw.FindName('Refresh').Add_Click($reload)
+    $Mach.Add_SelectionChanged($reload)
     $dw.FindName('BRead').Add_Click($doRead)
     $dw.FindName('BSend').Add_Click($doSend)
     $dw.FindName('BAttach').Add_Click($doAttach)
